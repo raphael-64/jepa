@@ -24,9 +24,9 @@ class ConvEncoder(nn.Module):
         
         self.conv_blocks = nn.Sequential(*layers)
         
-        # Use adaptive pooling to handle any input size
-        # This makes the encoder robust to different input resolutions
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        # Use Max Pooling instead of Avg Pooling to preserve small features (like the ball)
+        # AdaptiveAvgPool washes out small bright objects against dark background
+        self.adaptive_pool = nn.AdaptiveMaxPool2d((4, 4))
         self.flatten_dim = channels[-1] * 4 * 4
         self.fc = nn.Linear(self.flatten_dim, latent_dim)
     
@@ -109,29 +109,47 @@ class ContextEncoder(nn.Module):
 
 
 class Predictor(nn.Module):
-    """Predictor g: maps context → predicted latent z_hat_{t+k}."""
+    """Predictor g: maps (context, future_actions) → predicted latent z_hat_{t+k}."""
     
-    def __init__(self, ctx_dim, latent_dim=512, d_offset=64, max_offset=10):
+    def __init__(self, ctx_dim, latent_dim=512, d_offset=64, max_offset=10, 
+                 action_dim=None, d_action_embed=64):
         super().__init__()
         self.latent_dim = latent_dim
         self.d_offset = d_offset
+        self.action_dim = action_dim
+        self.use_actions = action_dim is not None
         
         # Offset embedding
         self.offset_embed = nn.Embedding(max_offset + 1, d_offset)
         
-        # MLP: [ctx_dim + d_offset → 2*latent_dim → latent_dim]
-        self.mlp = nn.Sequential(
-            nn.Linear(ctx_dim + d_offset, 2 * latent_dim),
-            nn.LayerNorm(2 * latent_dim),
+        # Action embedding
+        if self.use_actions:
+            self.action_embed = nn.Linear(action_dim, d_action_embed)
+            input_dim = ctx_dim + d_offset + d_action_embed
+        else:
+            input_dim = ctx_dim + d_offset
+        
+        # Deeper Residual MLP
+        hidden_dim = 2 * latent_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(2 * latent_dim, latent_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim)
         )
     
-    def forward(self, h_ctx, k):
+    def forward(self, h_ctx, k, a_pred=None):
         """
         Args:
             h_ctx: (B, ctx_dim) - context representation
             k: int or tensor of shape (B,) - prediction offset(s)
+            a_pred: (B, k, action_dim) or None - future actions to condition on
         Returns:
             z_hat: (B, latent_dim) - predicted latent
         """
@@ -143,11 +161,34 @@ class Predictor(nn.Module):
         # Embed offset
         e_k = self.offset_embed(k_tensor)  # (B, d_offset)
         
-        # Concatenate context and offset
-        h = torch.cat([h_ctx, e_k], dim=-1)  # (B, ctx_dim + d_offset)
+        # Build input list
+        inputs = [h_ctx, e_k]
+        
+        if self.use_actions and a_pred is not None:
+            # For k-step prediction, we'll use the first action in the sequence
+            # This is a simplification but enough to make the paddle move!
+            
+            if a_pred.ndim == 3:
+                # Take the first action (immediate next move)
+                action = a_pred[:, 0, :] 
+            else:
+                action = a_pred
+                
+            a_emb = self.action_embed(action) # (B, d_action_embed)
+            inputs.append(a_emb)
+        elif self.use_actions and a_pred is None:
+            # If we expect actions but none provided (e.g. inference without action plan)
+            # Use zero embedding
+            B = h_ctx.shape[0]
+            a_zeros = torch.zeros(B, self.action_dim, device=h_ctx.device)
+            a_emb = self.action_embed(a_zeros)
+            inputs.append(a_emb)
+        
+        # Concatenate context, offset, and action
+        h = torch.cat(inputs, dim=-1)
         
         # Predict latent
-        z_hat = self.mlp(h)  # (B, latent_dim)
+        z_hat = self.net(h)  # (B, latent_dim)
         
         return z_hat
 
@@ -192,7 +233,7 @@ def variance_loss(embeddings, eps=1e-4):
 def covariance_loss(embeddings):
     """
     Decorrelate dimensions to prevent redundancy.
-    Based on VICReg regularization.
+    Simplified VICReg-style covariance regularization.
     
     Args:
         embeddings: (B, D) tensor of embeddings
@@ -201,11 +242,20 @@ def covariance_loss(embeddings):
         loss: scalar tensor penalizing correlated dimensions
     """
     B, D = embeddings.shape
-    embeddings = embeddings - embeddings.mean(dim=0)
+    if B <= 1:
+        # Can't compute covariance with batch size <= 1
+        return torch.tensor(0.0, device=embeddings.device)
+    
+    # Center the embeddings
+    embeddings = embeddings - embeddings.mean(dim=0, keepdim=True)
+    
+    # Compute covariance matrix
     cov = (embeddings.T @ embeddings) / (B - 1)
-    # Off-diagonal elements
-    off_diagonal = cov.flatten()[:-1].view(D - 1, D + 1)[:, 1:].flatten()
-    return off_diagonal.pow(2).sum() / D
+    
+    # Extract off-diagonal elements (simpler approach)
+    # Sum of squared off-diagonal elements, normalized by D
+    cov_off_diag = cov - torch.diag(torch.diagonal(cov))
+    return cov_off_diag.pow(2).sum() / D
 
 
 class JEPAWorldModel(nn.Module):
@@ -254,7 +304,9 @@ class JEPAWorldModel(nn.Module):
             ctx_dim=ctx_dim,
             latent_dim=config['latent_dim'],
             d_offset=config.get('d_offset', 64),
-            max_offset=config.get('max_offset', 10)
+            max_offset=config.get('max_offset', 10),
+            action_dim=config.get('action_dim'),
+            d_action_embed=config.get('d_action_embed', 64)
         )
         
         # Projection heads
@@ -317,7 +369,15 @@ class JEPAWorldModel(nn.Module):
         final_losses = []
         
         for k in prediction_offsets:
-            z_hat = self.predictor(h_ctx, k)          # (B, latent_dim)
+            # Get future actions for conditioning
+            if a_seq is not None:
+                # Actions from t to t+k-1
+                # We need k actions to predict k steps ahead
+                a_pred = a_seq[:, t:t+k, :]
+            else:
+                a_pred = None
+                
+            z_hat = self.predictor(h_ctx, k, a_pred)  # (B, latent_dim)
             y_pred = self.proj_pred(z_hat)            # (B, proj_dim)
             y_targ = self.proj_targ(z_tgt[k])         # (B, proj_dim)
             
@@ -328,14 +388,14 @@ class JEPAWorldModel(nn.Module):
                 print(f"  y_targ has NaN: {torch.isnan(y_targ).any()}")
                 continue
             
-            # CRITICAL: Apply variance loss to ENCODER LATENTS, not just projections
-            # This prevents the encoder itself from collapsing
+            # CRITICAL: Apply variance AND covariance loss to PREDICTIONS ONLY
+            # Don't regularize EMA targets (they're stop-grad anyway)
             var_loss_latent_pred = variance_loss(z_hat)
-            var_loss_latent_targ = variance_loss(z_tgt[k])
+            cov_loss_latent_pred = covariance_loss(z_hat)
             
-            # Also apply to projections (less important)
+            # Also apply to predicted projections only
             var_loss_proj_pred = variance_loss(y_pred)
-            var_loss_proj_targ = variance_loss(y_targ)
+            cov_loss_proj_pred = covariance_loss(y_pred)
             
             if normalize_proj:
                 eps = 1e-6
@@ -348,32 +408,41 @@ class JEPAWorldModel(nn.Module):
             # MSE loss on normalized embeddings
             loss_mse = F.mse_loss(y_pred_norm, y_targ_norm)
             
-            # Total loss with STRONG variance regularization
-            # Weight needs to be large enough to prevent collapse (VICReg uses 25.0)
-            var_weight_latent = 10.0  # Strong regularization on latents
-            var_weight_proj = 1.0     # Weaker on projections
+            # Regularization: minimal weights - just enough to prevent collapse
+            # VICReg-style: variance prevents collapse, covariance prevents redundancy
+            var_weight_latent = 0.01  # Very small - MSE should be primary signal
+            cov_weight_latent = 0.001 # Covariance is per-dimension so very small
+            var_weight_proj = 0.005   # Minimal on projections
+            cov_weight_proj = 0.0005  # Tiny covariance weight
             
-            total_var_loss = (var_weight_latent * (var_loss_latent_pred + var_loss_latent_targ) + 
-                            var_weight_proj * (var_loss_proj_pred + var_loss_proj_targ))
+            total_reg_loss = (var_weight_latent * var_loss_latent_pred + 
+                             cov_weight_latent * cov_loss_latent_pred +
+                             var_weight_proj * var_loss_proj_pred +
+                             cov_weight_proj * cov_loss_proj_pred)
             
-            loss_k = loss_mse + total_var_loss
+            loss_k = loss_mse + total_reg_loss
             
             # Safety check
             if torch.isnan(loss_k) or torch.isinf(loss_k):
                 print(f"Warning: Invalid loss at k={k}: {loss_k.item()}")
                 print(f"  loss_mse: {loss_mse.item()}")
-                print(f"  total_var_loss: {total_var_loss.item()}")
+                print(f"  total_reg_loss: {total_reg_loss.item()}")
                 continue
             
             losses[f"loss_k{k}"] = loss_k.item()
             losses[f"mse_k{k}"] = loss_mse.item()
-            losses[f"var_latent_k{k}"] = (var_loss_latent_pred + var_loss_latent_targ).item()
-            losses[f"var_proj_k{k}"] = (var_loss_proj_pred + var_loss_proj_targ).item()
+            losses[f"var_latent_k{k}"] = var_loss_latent_pred.item()
+            losses[f"cov_latent_k{k}"] = cov_loss_latent_pred.item()
+            losses[f"var_proj_k{k}"] = var_loss_proj_pred.item()
+            losses[f"cov_proj_k{k}"] = cov_loss_proj_pred.item()
             final_losses.append(loss_k)
         
         if len(final_losses) == 0:
             print("Warning: All prediction offsets produced invalid losses!")
-            return torch.tensor(0.0, device=x_seq.device, requires_grad=True), losses
+            # Create a dummy loss that's connected to the model parameters
+            # Use a small term from the encoder to maintain gradient flow
+            dummy_loss = 0.0 * self.encoder.fc.weight.sum()
+            return dummy_loss, losses
         
         loss = sum(final_losses) / len(final_losses)
 
@@ -406,24 +475,99 @@ class JEPAWorldModel(nn.Module):
             # Sample one time step per sequence
             t_values = torch.randint(t_min, t_max, (B,), device=x_seq.device)
             
-            # Process each sequence at its sampled time
-            losses = []
-            all_diagnostics = []
+            # Build batch by extracting the sampled timestep from each sequence
+            # This allows proper variance/covariance computation across batch
+            z_ctx_list = []
+            z_tgt_dict = {k: [] for k in prediction_offsets}
+            a_ctx_list = [] if a_seq is not None else None
+            a_pred_dict = {k: [] for k in prediction_offsets} if a_seq is not None else None
             
             for b in range(B):
                 t = t_values[b].item()
-                loss_b, diag_b = self.forward_step(
-                    x_seq[b:b+1], 
-                    a_seq[b:b+1] if a_seq is not None else None,
-                    t, 
-                    prediction_offsets
-                )
-                losses.append(loss_b)
-                all_diagnostics.append(diag_b)
+                
+                # Encode context
+                z_ctx_b = []
+                for i in range(t-K_ctx+1, t+1):
+                    z_ctx_b.append(self.encoder(x_seq[b:b+1, i]))
+                z_ctx_list.append(torch.stack(z_ctx_b, dim=1))  # (1, K_ctx, D)
+                
+                # Encode targets (EMA encoder)
+                with torch.no_grad():
+                    for k in prediction_offsets:
+                        z_tgt_dict[k].append(self.encoder_ema(x_seq[b:b+1, t+k]))
+                
+                # Get actions if present
+                if a_seq is not None:
+                    # Context actions: t-K_ctx+1 to t-1
+                    a_ctx_list.append(a_seq[b:b+1, t-K_ctx+1:t, :])
+                    
+                    # Future actions: t to t+k-1
+                    for k in prediction_offsets:
+                        a_pred_dict[k].append(a_seq[b:b+1, t:t+k, :])
             
-            loss = torch.stack(losses).mean()
-            diagnostics = {k: sum(d[k] for d in all_diagnostics) / len(all_diagnostics) 
-                          for k in all_diagnostics[0]}
+            # Stack into batches
+            z_ctx_batch = torch.cat(z_ctx_list, dim=0)  # (B, K_ctx, D)
+            z_tgt_batch = {k: torch.cat(z_tgt_dict[k], dim=0) for k in prediction_offsets}  # (B, D) for each k
+            a_ctx_batch = torch.cat(a_ctx_list, dim=0) if a_ctx_list is not None else None
+            a_pred_batch = {k: torch.cat(a_pred_dict[k], dim=0) for k in prediction_offsets} if a_pred_dict is not None else None
+            
+            # Get context representation
+            h_ctx = self.ctx_encoder(z_ctx_batch, a_ctx_batch)  # (B, ctx_dim)
+            
+            # Compute loss with regularization on full batch
+            losses = {}
+            final_losses = []
+            
+            for k in prediction_offsets:
+                a_pred = a_pred_batch[k] if a_pred_batch is not None else None
+                z_hat = self.predictor(h_ctx, k, a_pred)  # (B, latent_dim)
+                y_pred = self.proj_pred(z_hat)     # (B, proj_dim)
+                y_targ = self.proj_targ(z_tgt_batch[k])  # (B, proj_dim)
+                
+                # Regularization losses on PREDICTIONS ONLY (not EMA targets)
+                var_loss_latent_pred = variance_loss(z_hat)
+                cov_loss_latent_pred = covariance_loss(z_hat)
+                
+                var_loss_proj_pred = variance_loss(y_pred)
+                cov_loss_proj_pred = covariance_loss(y_pred)
+                
+                # Normalize projections
+                if self.config.get('normalize_proj', True):
+                    eps = 1e-6
+                    y_pred_norm = F.normalize(y_pred, p=2, dim=-1, eps=eps)
+                    y_targ_norm = F.normalize(y_targ, p=2, dim=-1, eps=eps)
+                else:
+                    y_pred_norm = y_pred
+                    y_targ_norm = y_targ
+                
+                # MSE loss
+                loss_mse = F.mse_loss(y_pred_norm, y_targ_norm)
+                
+                # Regularization: minimal weights - just enough to prevent collapse
+                var_weight_latent = 0.01  # Very small - MSE should be primary signal
+                cov_weight_latent = 0.001 # Covariance is per-dimension so very small
+                var_weight_proj = 0.005
+                cov_weight_proj = 0.0005
+                
+                total_reg_loss = (var_weight_latent * var_loss_latent_pred + 
+                                 cov_weight_latent * cov_loss_latent_pred +
+                                 var_weight_proj * var_loss_proj_pred +
+                                 cov_weight_proj * cov_loss_proj_pred)
+                
+                loss_k = loss_mse + total_reg_loss
+                
+                # Store diagnostics
+                losses[f"loss_k{k}"] = loss_k.item()
+                losses[f"mse_k{k}"] = loss_mse.item()
+                losses[f"var_latent_k{k}"] = var_loss_latent_pred.item()
+                losses[f"cov_latent_k{k}"] = cov_loss_latent_pred.item()
+                losses[f"var_proj_k{k}"] = var_loss_proj_pred.item()
+                losses[f"cov_proj_k{k}"] = cov_loss_proj_pred.item()
+                final_losses.append(loss_k)
+            
+            loss = sum(final_losses) / len(final_losses)
+            losses['loss'] = loss.item()
+            diagnostics = losses
         else:
             # Use fixed time step (e.g., middle of sequence)
             t = (t_min + t_max) // 2

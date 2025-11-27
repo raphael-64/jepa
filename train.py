@@ -240,13 +240,21 @@ def train(config, num_epochs=100, save_dir='./checkpoints', device='cuda',
         # Epoch summary
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1} complete")
-        print(f"  Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"  Total Loss:   {avg_loss:.4f} | Val: {avg_val_loss:.4f}")
+        
+        # Show MSE (actual prediction quality) prominently
+        avg_mse_train = avg_diagnostics.get('mse_k1', 0)
+        avg_mse_val = avg_val_diagnostics.get('mse_k1', 0)
+        print(f"  MSE (k=1):    {avg_mse_train:.6f} | Val: {avg_mse_val:.6f}  ← PREDICTION QUALITY")
+        
         print(f"  Learning Rate: {current_lr:.6f}")
-        for k in sorted(avg_diagnostics.keys()):
-            if k.startswith('loss_k'):
-                val_k = k.replace('loss_k', 'val_loss_k')
-                val_v = avg_val_diagnostics.get(k, 0)
-                print(f"  {k}: {avg_diagnostics[k]:.4f} | {val_k}: {val_v:.4f}")
+        
+        # Show detailed breakdown for first offset
+        if 'var_latent_k1' in avg_diagnostics:
+            print(f"  Regularization breakdown (k=1):")
+            print(f"    Var(latent): {avg_diagnostics.get('var_latent_k1', 0):.4f}")
+            print(f"    Cov(latent): {avg_diagnostics.get('cov_latent_k1', 0):.4f}")
+        
         print(f"{'='*60}\n")
         
         # Save metrics to JSON

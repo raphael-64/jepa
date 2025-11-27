@@ -12,7 +12,8 @@ class AtariDataset(Dataset):
     """Atari dataset for JEPA training using Minari."""
     
     def __init__(self, dataset_name=None, env_name='ALE/Pong-v5', seq_length=10, 
-                 frame_size=84, use_actions=True, max_episodes=None):
+                 frame_size=84, use_actions=True, max_episodes=None, 
+                 crop_top=34, crop_bottom=16):
         """
         Args:
             dataset_name: Minari dataset name (e.g., 'atari/pong/expert-v0'). 
@@ -22,10 +23,14 @@ class AtariDataset(Dataset):
             frame_size: Size to resize frames to (e.g., 84)
             use_actions: Whether to include actions
             max_episodes: Maximum number of episodes to use (None = use all)
+            crop_top: Pixels to crop from top (removes score UI in Atari)
+            crop_bottom: Pixels to crop from bottom
         """
         self.seq_length = seq_length
         self.frame_size = frame_size
         self.use_actions = use_actions
+        self.crop_top = crop_top
+        self.crop_bottom = crop_bottom
         
         # Load Minari dataset
         if dataset_name is None:
@@ -123,11 +128,18 @@ class AtariDataset(Dataset):
         print(f"Dataset ready: {len(self.episodes)} episodes, action_dim={self.action_dim}")
     
     def _preprocess_frame(self, frame):
-        """Preprocess frame: resize to frame_size x frame_size, normalize."""
+        """Preprocess frame: crop, resize to frame_size x frame_size, normalize."""
         # Minari observations are Box(0, 255, (210, 160, 3), uint8)
         # Convert to numpy if needed
         if not isinstance(frame, np.ndarray):
             frame = np.array(frame)
+        
+        # Crop to remove score/UI (Atari-specific preprocessing)
+        # Original Atari: (210, 160, 3) -> After crop: (~160, 160, 3)
+        # This focuses the model on gameplay (paddle + ball) not score
+        if len(frame.shape) >= 2 and (self.crop_top > 0 or self.crop_bottom > 0):
+            h, w = frame.shape[:2]
+            frame = frame[self.crop_top:h-self.crop_bottom, :]
         
         # Handle different shapes
         if len(frame.shape) == 3:
@@ -171,17 +183,30 @@ class AtariDataset(Dataset):
         actions = episode['actions']
         
         # Sample random start position
-        max_start = len(frames) - self.seq_length
-        if max_start < 0:
-            # Pad if episode too short
-            padding = np.zeros((self.seq_length - len(frames),) + frames.shape[1:], dtype=frames.dtype)
-            frames = np.concatenate([frames, padding], axis=0)
-            max_start = 0
-        
-        start = np.random.randint(0, max_start + 1)
-        
-        # Extract sequence
-        x_seq = frames[start:start + self.seq_length]  # (T, H, W, C)
+        max_retries = 10
+        for _ in range(max_retries):
+            max_start = len(frames) - self.seq_length
+            if max_start < 0:
+                # Pad if episode too short
+                padding = np.zeros((self.seq_length - len(frames),) + frames.shape[1:], dtype=frames.dtype)
+                frames = np.concatenate([frames, padding], axis=0)
+                max_start = 0
+            
+            start = np.random.randint(0, max_start + 1)
+            
+            # Extract sequence
+            x_seq = frames[start:start + self.seq_length]  # (T, H, W, C)
+            
+            # Check for movement (skip boring sequences)
+            # Calculate mean difference between first and last frame
+            if len(frames) >= self.seq_length:
+                diff = np.mean(np.abs(x_seq[-1] - x_seq[0]))
+                if diff < 0.01:  # Threshold for "boring"
+                    continue
+            
+            # Found good sequence or ran out of retries
+            break
+            
         x_seq = torch.from_numpy(x_seq).permute(0, 3, 1, 2).float()  # (T, C, H, W)
         
         if self.use_actions and actions is not None and len(actions) > 0:
