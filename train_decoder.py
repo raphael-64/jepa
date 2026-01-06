@@ -79,8 +79,12 @@ def train_decoder(jepa_model, dataloader, num_epochs=20, device='cuda', lr=1e-3,
             # Decode
             x_recon = decoder(z)  # (B*T, C, H, W)
             
-            # Reconstruction loss
-            loss = criterion(x_recon, x_flat)
+            # Reconstruction loss with emphasis on non-background pixels
+            # Create a weight mask: higher weight for non-zero pixels (objects)
+            # Pong background is 0.0 (black) after normalization
+            # We give 10x weight to anything bright
+            weights = 1.0 + 9.0 * (x_flat > 0.1).float()
+            loss = (weights * (x_recon - x_flat) ** 2).mean()
             
             # Backward
             optimizer.zero_grad()
